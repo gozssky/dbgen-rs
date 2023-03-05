@@ -13,6 +13,7 @@ use crate::{
 
 use chrono::{NaiveDateTime, ParseResult, Utc};
 use data_encoding::{DecodeError, DecodeKind, HEXLOWER_PERMISSIVE};
+use dyn_clone::DynClone;
 use flate2::write::GzEncoder;
 use muldiv::MulDiv;
 use pbr::{MultiBar, Units};
@@ -684,7 +685,7 @@ impl FromStr for RngName {
 
 impl RngName {
     /// Creates an RNG engine given the name. The RNG engine instance will be seeded from `src`.
-    fn create(self, src: &mut rand_hc::Hc128Rng) -> Box<dyn RngCore + Send> {
+    fn create(self, src: &mut rand_hc::Hc128Rng) -> Box<dyn RngCoreClone + Send> {
         match self {
             Self::ChaCha12 => Box::new(rand_chacha::ChaCha12Rng::from_seed(src.gen())),
             Self::ChaCha20 => Box::new(rand_chacha::ChaCha20Rng::from_seed(src.gen())),
@@ -697,6 +698,20 @@ impl RngName {
         }
     }
 }
+
+/// A cloneable `RngCore` trait object.
+pub trait RngCoreClone: RngCore + DynClone {}
+
+dyn_clone::clone_trait_object!(RngCoreClone);
+
+impl RngCoreClone for rand_chacha::ChaCha12Rng {}
+impl RngCoreClone for rand_chacha::ChaCha20Rng {}
+impl RngCoreClone for rand_hc::Hc128Rng {}
+impl RngCoreClone for rand_isaac::IsaacRng {}
+impl RngCoreClone for rand_isaac::Isaac64Rng {}
+impl RngCoreClone for rand_xorshift::XorShiftRng {}
+impl RngCoreClone for rand_pcg::Pcg32 {}
+impl RngCoreClone for StepRng {}
 
 /// Names of output formats supported by `dbgen`.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

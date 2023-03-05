@@ -1,6 +1,7 @@
 //! Evaluating compiled expressions into values.
 
 use crate::{
+    cli::RngCoreClone,
     error::Error,
     functions::{Arguments, Function},
     parser::{Expr, QName},
@@ -8,7 +9,7 @@ use crate::{
     value::Value,
 };
 use chrono::{NaiveDateTime, Utc};
-use rand::{distributions::Bernoulli, seq::SliceRandom, Rng, RngCore};
+use rand::{distributions::Bernoulli, seq::SliceRandom, Rng};
 use rand_distr::{LogNormal, Uniform};
 use rand_regex::EncodedString;
 use std::{cmp::Ordering, fmt, fs, ops::Range, path::PathBuf, sync::Arc};
@@ -59,11 +60,12 @@ impl CompileContext {
 }
 
 /// The external mutable state used during evaluation.
+#[derive(Clone)]
 pub struct State {
     pub(crate) row_num: u64,
     /// Defines the value of `subrownum`.
     pub sub_row_num: u64,
-    rng: Box<dyn RngCore>,
+    rng: Box<dyn RngCoreClone>,
     compile_context: CompileContext,
 }
 
@@ -86,7 +88,7 @@ impl State {
     /// - `row_num`: The starting row number in this state. The first file should have this set
     ///     to 1, and the second to `rows_count * inserts_count + 1`, etc.
     /// - `rng`: The seeded random number generator.
-    pub fn new(row_num: u64, rng: Box<dyn RngCore>, compile_context: CompileContext) -> Self {
+    pub fn new(row_num: u64, rng: Box<dyn RngCoreClone>, compile_context: CompileContext) -> Self {
         Self {
             row_num,
             sub_row_num: 1,
