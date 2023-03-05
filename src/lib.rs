@@ -1,6 +1,5 @@
 #![warn(
     clippy::pedantic,
-    missing_debug_implementations,
     trivial_casts,
     trivial_numeric_casts,
     unreachable_pub,
@@ -38,6 +37,7 @@ pub mod functions;
 pub mod lexctr;
 pub mod number;
 pub mod parser;
+pub mod s3;
 #[cfg(feature = "cli")]
 pub mod schemagen_cli;
 pub mod span;

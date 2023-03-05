@@ -6,6 +6,8 @@ use crate::{
     format::{CsvFormat, Format, Options, SqlFormat, SqlInsertSetFormat},
     lexctr::LexCtr,
     parser::{QName, Template},
+    s3,
+    s3::{Object, ObjectContent},
     span::{Registry, ResultExt, SpanExt, S},
     value::{Value, TIMESTAMP_FORMAT},
     writer::{self, Writer},
@@ -26,6 +28,7 @@ use rayon::{
     iter::{IntoParallelIterator, ParallelIterator},
     ThreadPoolBuilder,
 };
+use s3_server::{S3Service, SimpleAuth};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     borrow::Cow,
@@ -38,6 +41,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     thread::{sleep, spawn},
     time::Duration,
 };
@@ -95,8 +99,9 @@ pub struct Args {
     pub schema_name: Option<String>,
 
     /// Output directory.
-    #[structopt(short, long, parse(from_os_str))]
-    pub out_dir: PathBuf,
+    #[structopt(short, long, parse(from_os_str), conflicts_with("s3"), required_unless("s3"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_dir: Option<PathBuf>,
 
     /// Total number of file generator threads.
     #[structopt(short = "k", long, default_value = "1")]
@@ -243,6 +248,31 @@ pub struct Args {
     #[structopt(long, short = "D")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub initialize: Vec<String>,
+
+    /// Serve generated data over S3.
+    #[structopt(long, conflicts_with("compression"))]
+    #[serde(skip_serializing_if = "is_false")]
+    pub s3: bool,
+
+    /// S3 bucket name.
+    #[structopt(long, requires("s3"), required_unless("out-dir"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_bucket: Option<String>,
+
+    /// S3 access key.
+    #[structopt(long, requires("s3"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_access_key: Option<String>,
+
+    /// S3 secret key.
+    #[structopt(long, requires("s3"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_secret_key: Option<String>,
+
+    /// S3 listen address.
+    #[structopt(long, default_value = "127.0.0.1:9000")]
+    #[serde(skip_serializing_if = "is_default_s3_listen_addr")]
+    pub s3_listen_addr: String,
 }
 
 impl Default for Args {
@@ -251,7 +281,7 @@ impl Default for Args {
             qualified: false,
             table_name: None,
             schema_name: None,
-            out_dir: PathBuf::default(),
+            out_dir: None,
             files_count: 1,
             inserts_count: 1,
             rows_count: 1,
@@ -281,6 +311,11 @@ impl Default for Args {
             no_schemas: false,
             no_data: false,
             initialize: Vec::new(),
+            s3: false,
+            s3_bucket: None,
+            s3_access_key: None,
+            s3_secret_key: None,
+            s3_listen_addr: "127.0.0.1:9000".to_owned(),
         }
     }
 }
@@ -335,6 +370,10 @@ fn is_sql(format: &FormatName) -> bool {
 
 fn is_default_components(components: &[ComponentName]) -> bool {
     ComponentName::union_all(components.iter().copied()) == ComponentName::Table as u8 | ComponentName::Data as u8
+}
+
+fn is_default_s3_listen_addr(addr: &str) -> bool {
+    addr == "127.0.0.1:9000"
 }
 
 fn parse_row_count(input: &str) -> Result<u64, parse_size::Error> {
@@ -438,7 +477,7 @@ fn read_template_file(path: &Path) -> Result<String, S<Error>> {
 }
 
 /// Runs the CLI program.
-pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
+pub fn run(args: Args, span_registry: &mut Registry) -> Result<Option<S3Service>, S<Error>> {
     let row_args = args.row_args();
     let input = match (args.template_string, &args.template) {
         (Some(input), _) => input,
@@ -448,7 +487,7 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
                 kind: "template",
                 value: "".to_owned(),
             }
-            .no_span())
+            .no_span());
         }
     };
     let mut template = Template::parse(&input, &args.initialize, args.schema_name.as_deref(), span_registry)?;
@@ -472,7 +511,9 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
         .map(|t| ctx.compile_table(t))
         .collect::<Result<_, _>>()?;
 
-    create_dir_all(&args.out_dir).with_path("create output directory", &args.out_dir)?;
+    if let Some(out_dir) = &args.out_dir {
+        create_dir_all(out_dir).with_path("create output directory", out_dir)?;
+    }
 
     let compress_level = args.compress_level;
     let mut components_mask = ComponentName::union_all(args.components);
@@ -507,13 +548,24 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
         compression: args.compression.map(|c| (c, compress_level)),
         components_mask,
         file_size: args.size,
+        bucket_name: args.s3_bucket,
     };
 
+    let mut objects = Vec::new();
+
     if ComponentName::Schema.is_in(env.components_mask) {
-        env.write_schema_schema()?;
+        if args.s3 {
+            objects.extend(env.make_schema_schema_objects());
+        } else {
+            env.write_schema_schema()?;
+        }
     }
     if ComponentName::Table.is_in(env.components_mask) {
-        env.write_table_schema()?;
+        if args.s3 {
+            objects.extend(env.make_table_schema_objects());
+        } else {
+            env.write_table_schema()?;
+        }
     }
 
     let meta_seed = args.seed.unwrap_or_else(|| OsRng.gen());
@@ -543,6 +595,9 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
         }
     });
 
+    let objects = Arc::new(Mutex::new(objects));
+    let objects_clone = objects.clone();
+
     let iv = (0..row_args.files_count)
         .map(move |i| {
             let file_index = i + 1;
@@ -562,13 +617,19 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
                     },
                 },
                 u64::from(i) * row_args.rows_per_file + 1,
+                objects_clone.clone(),
             )
         })
         .collect::<Vec<_>>();
+
+    let env_clone = env.clone();
+    let ctx_clone = ctx.clone();
     let res = pool.install(move || {
-        iv.into_par_iter().try_for_each(|(seed, file_info, row_num)| {
-            let mut state = State::new(row_num, seed, ctx.clone());
-            env.write_data_file(&file_info, &mut state)
+        iv.into_par_iter().try_for_each(|(seed, file_info, row_num, objects)| {
+            let mut state = State::new(row_num, seed, ctx_clone.clone());
+            let res = env_clone.write_data_file(&file_info, &mut state)?;
+            objects.lock().unwrap().extend(res);
+            Ok(())
         })
     });
 
@@ -576,7 +637,22 @@ pub fn run(args: Args, span_registry: &mut Registry) -> Result<(), S<Error>> {
     progress_bar_thread.join().unwrap();
 
     res?;
-    Ok(())
+
+    if !args.s3 {
+        return Ok(None);
+    }
+
+    let mut objects: Vec<Object> = objects.lock().unwrap().clone();
+    objects.sort();
+
+    let mut s3_service = S3Service::new(s3::Storage::new(env, objects, ctx.current_timestamp));
+    if let (Some(access_key), Some(secret_key)) = (args.s3_access_key, args.s3_secret_key) {
+        let mut auth = SimpleAuth::new();
+        auth.register(access_key, secret_key);
+        s3_service.set_auth(auth);
+    }
+
+    Ok(Some(s3_service))
 }
 
 /// Random number generator (RNG) seed.
@@ -677,7 +753,7 @@ impl FromStr for RngName {
                 return Err(Error::UnsupportedCliParameter {
                     kind: "RNG",
                     value: name.to_owned(),
-                })
+                });
             }
         })
     }
@@ -700,17 +776,24 @@ impl RngName {
 }
 
 /// A cloneable `RngCore` trait object.
-pub trait RngCoreClone: RngCore + DynClone {}
+pub trait RngCoreClone: RngCore + DynClone + Sync + Send {}
 
 dyn_clone::clone_trait_object!(RngCoreClone);
 
 impl RngCoreClone for rand_chacha::ChaCha12Rng {}
+
 impl RngCoreClone for rand_chacha::ChaCha20Rng {}
+
 impl RngCoreClone for rand_hc::Hc128Rng {}
+
 impl RngCoreClone for rand_isaac::IsaacRng {}
+
 impl RngCoreClone for rand_isaac::Isaac64Rng {}
+
 impl RngCoreClone for rand_xorshift::XorShiftRng {}
+
 impl RngCoreClone for rand_pcg::Pcg32 {}
+
 impl RngCoreClone for StepRng {}
 
 /// Names of output formats supported by `dbgen`.
@@ -736,7 +819,7 @@ impl FromStr for FormatName {
                 return Err(Error::UnsupportedCliParameter {
                     kind: "output format",
                     value: name.to_owned(),
-                })
+                });
             }
         })
     }
@@ -803,7 +886,7 @@ impl FromStr for CompressionName {
                 return Err(Error::UnsupportedCliParameter {
                     kind: "compression format",
                     value: name.to_owned(),
-                })
+                });
             }
         })
     }
@@ -857,7 +940,7 @@ impl FromStr for ComponentName {
                 return Err(Error::UnsupportedCliParameter {
                     kind: "component",
                     value: name.to_owned(),
-                })
+                });
             }
         })
     }
@@ -896,6 +979,7 @@ struct FormatWriter<'a> {
     /// The output file format.
     format: &'a dyn Format,
 }
+
 impl<'a> FormatWriter<'a> {
     /// Creates a new [`WriteWrapper`].
     fn new(
@@ -927,15 +1011,24 @@ impl<'a> FormatWriter<'a> {
     }
 
     /// Checks if the current written size exceeds the size limit.
-    fn try_rotate(&mut self) -> bool {
-        if let Some((size, counter)) = &mut self.target_size_and_counter {
-            if self.written_size >= *size {
-                counter.inc();
-                self.written_size = 0;
-                return true;
-            }
+    /// If so, rotates the file, returning the old path and the old size.
+    fn try_rotate(&mut self) -> Option<(PathBuf, usize)> {
+        let should_rotate = if let Some((size, _)) = &self.target_size_and_counter {
+            self.written_size >= *size
+        } else {
+            false
+        };
+        if !should_rotate {
+            return None;
         }
-        false
+
+        let old_path = self.path();
+        let old_size = self.written_size;
+        if let Some((_, counter)) = &mut self.target_size_and_counter {
+            counter.inc();
+            self.written_size = 0;
+        }
+        Some((old_path, old_size as usize))
     }
 }
 
@@ -951,7 +1044,7 @@ impl Write for FormatWriter<'_> {
     }
 }
 
-impl writer::Writer for FormatWriter<'_> {
+impl Writer for FormatWriter<'_> {
     fn write_value(&mut self, value: &Value) -> Result<(), S<Error>> {
         self.format
             .write_value(self, value)
@@ -991,8 +1084,9 @@ impl writer::Writer for FormatWriter<'_> {
 
 /// The environmental data shared by all data writers.
 #[allow(clippy::struct_excessive_bools)] // the booleans aren't used as state-machines.
-struct Env {
-    out_dir: PathBuf,
+#[derive(Debug, Clone)]
+pub struct Env {
+    out_dir: Option<PathBuf>,
     file_num_digits: usize,
     tables: Vec<Table>,
     qualified: bool,
@@ -1002,10 +1096,13 @@ struct Env {
     compression: Option<(CompressionName, u8)>,
     components_mask: u8,
     file_size: Option<u64>,
+    /// The bucket name for generated files.
+    pub bucket_name: Option<String>,
 }
 
 /// Information specific to a file and its derived tables.
-struct FileInfo {
+#[derive(Debug, Clone)]
+pub struct FileInfo {
     file_index: u32,
     inserts_count: u32,
     last_insert_rows_count: u32,
@@ -1014,6 +1111,7 @@ struct FileInfo {
 impl Env {
     /// Writes the `CREATE SCHEMA` schema files.
     fn write_schema_schema(&self) -> Result<(), S<Error>> {
+        let out_dir = self.out_dir.as_ref().unwrap();
         let mut schema_names = HashMap::with_capacity(1);
         for table in &self.tables {
             if let (Some(unique_name), Some(name)) = (table.name.unique_schema_name(), table.name.schema_name()) {
@@ -1021,7 +1119,7 @@ impl Env {
             }
         }
         for (unique_name, name) in schema_names {
-            let path = self.out_dir.join(format!("{}-schema-create.sql", unique_name));
+            let path = out_dir.join(format!("{}-schema-create.sql", unique_name));
             let mut file = BufWriter::new(File::create(&path).with_path("create schema schema file", &path)?);
             writeln!(file, "CREATE SCHEMA {};", name).with_path("write schema schema file", &path)?;
         }
@@ -1030,8 +1128,9 @@ impl Env {
 
     /// Writes the `CREATE TABLE` schema files.
     fn write_table_schema(&self) -> Result<(), S<Error>> {
+        let out_dir = self.out_dir.as_ref().unwrap();
         for table in &self.tables {
-            let path = self.out_dir.join(format!("{}-schema.sql", table.name.unique_name()));
+            let path = out_dir.join(format!("{}-schema.sql", table.name.unique_name()));
             let mut file = BufWriter::new(File::create(&path).with_path("create table schema file", &path)?);
             write!(
                 file,
@@ -1042,6 +1141,46 @@ impl Env {
             .with_path("write table schema file", &path)?;
         }
         Ok(())
+    }
+
+    /// Makes the schema schema objects.
+    fn make_schema_schema_objects(&self) -> Vec<Object> {
+        let mut objects = Vec::new();
+        let mut schema_names = HashMap::with_capacity(1);
+        for table in &self.tables {
+            if let (Some(unique_name), Some(name)) = (table.name.unique_schema_name(), table.name.schema_name()) {
+                schema_names.insert(unique_name, name);
+            }
+        }
+        for (unique_name, name) in schema_names {
+            let obj_name = format!("{}-schema-create.sql", unique_name);
+            let content = format!("CREATE SCHEMA {};", name);
+            objects.push(Object {
+                name: obj_name,
+                size: content.len(),
+                content: ObjectContent::Schema(content),
+            });
+        }
+        objects
+    }
+
+    /// Makes the table schema objects.
+    fn make_table_schema_objects(&self) -> Vec<Object> {
+        let mut objects = Vec::new();
+        for table in &self.tables {
+            let obj_name = format!("{}-schema.sql", table.name.unique_name());
+            let content = format!(
+                "CREATE TABLE {} {}",
+                table.name.table_name(self.qualified),
+                table.content
+            );
+            objects.push(Object {
+                name: obj_name,
+                size: content.len(),
+                content: ObjectContent::Schema(content),
+            });
+        }
+        objects
     }
 
     fn open_data_file(&self, path: PathBuf) -> Result<Box<dyn Write>, S<Error>> {
@@ -1059,14 +1198,23 @@ impl Env {
     }
 
     /// Writes the data file.
-    fn write_data_file(&self, info: &FileInfo, state: &mut State) -> Result<(), S<Error>> {
+    fn write_data_file(&self, info: &FileInfo, state: &mut State) -> Result<Vec<Object>, S<Error>> {
         let path_suffix = format!(".{0:01$}", info.file_index, self.file_num_digits);
         let format = self.format.create(&self.format_options);
 
+        let mut objects = Vec::new();
+        let content = ObjectContent::Data((info.clone(), state.clone()));
+
         let mut fwe = writer::Env::new(&self.tables, state, self.qualified, |table| {
-            let path = self.out_dir.join([table.name.unique_name(), &path_suffix].concat());
+            let path = self
+                .out_dir
+                .as_ref()
+                .unwrap_or(&PathBuf::new())
+                .join([table.name.unique_name(), &path_suffix].concat());
             let mut w = FormatWriter::new(path, self.format.extension(), self.file_size, &*format);
-            w.writer = BufWriter::new(self.open_data_file(w.path())?);
+            if self.out_dir.is_some() {
+                w.writer = BufWriter::new(self.open_data_file(w.path())?);
+            };
             Ok(w)
         })?;
 
@@ -1084,7 +1232,13 @@ impl Env {
             let mut total_uncommitted_size = 0;
             for (table, w) in fwe.tables() {
                 total_uncommitted_size += mem::take(&mut w.uncommitted_size);
-                if w.try_rotate() {
+                if let Some((old_path, old_size)) = w.try_rotate() {
+                    objects.push(Object {
+                        name: old_path.file_name().unwrap().to_string_lossy().to_string(),
+                        size: old_size,
+                        content: content.clone(),
+                    });
+
                     let new_path = w.path();
                     w.writer.flush().with_path("flush old file for rotation", &new_path)?;
                     w.writer = BufWriter::new(self.open_data_file(new_path)?);
@@ -1094,7 +1248,18 @@ impl Env {
             WRITTEN_SIZE.fetch_add(total_uncommitted_size, Ordering::Relaxed);
             WRITE_PROGRESS.fetch_add(rows_count.into(), Ordering::Relaxed);
         }
-        Ok(())
+
+        for (_, w) in fwe.tables() {
+            let path = w.path();
+            w.writer.flush().with_path("flush data file", &path)?;
+            objects.push(Object {
+                name: path.file_name().unwrap().to_string_lossy().to_string(),
+                size: w.written_size as usize,
+                content: content.clone(),
+            });
+        }
+
+        Ok(objects)
     }
 }
 

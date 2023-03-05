@@ -33,7 +33,7 @@ pub trait Writer {
 }
 
 /// The state of a table within [`Env`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TableState<'a, W: Writer> {
     /// The parsed table.
     table: &'a Table,

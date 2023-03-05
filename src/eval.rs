@@ -109,7 +109,7 @@ impl State {
 }
 
 /// A compiled table
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Table {
     /// Table name.
     pub name: QName,
@@ -170,7 +170,7 @@ impl CompileContext {
 }
 
 /// Represents a row of compiled values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Row(Vec<Compiled>);
 
 impl CompileContext {

@@ -38,7 +38,7 @@ pub trait Format {
 }
 
 /// Common options for the formatters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Options {
     /// Whether to escapes backslashes when writing a string.
     pub escape_backslash: bool,
