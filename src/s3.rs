@@ -8,7 +8,7 @@ use crate::{
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use s3_server::dto::{
-    Bucket, CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
+    Bucket, ByteStream, CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
     CopyObjectError, CopyObjectOutput, CopyObjectRequest, CreateBucketError, CreateBucketOutput, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest, DeleteBucketError,
     DeleteBucketOutput, DeleteBucketRequest, DeleteObjectError, DeleteObjectOutput, DeleteObjectRequest,
@@ -20,8 +20,7 @@ use s3_server::dto::{
     UploadPartError, UploadPartOutput, UploadPartRequest,
 };
 use s3_server::errors::{S3Error, S3ErrorCode, S3StorageResult};
-use s3_server::S3Storage;
-// use core::slice;
+use s3_server::{headers::Range, S3Storage};
 
 /// A storage implementation for S3.
 pub struct Storage {
@@ -105,6 +104,13 @@ macro_rules! not_supported {
     }};
 }
 
+/// Create a `InvalidRequest` error
+macro_rules! invalid_request {
+    ($msg:expr $(, $source:expr)?) => {{
+        code_error!(InvalidRequest, $msg $(, $source)?)
+    }};
+}
+
 #[async_trait]
 impl S3Storage for Storage {
     async fn complete_multipart_upload(
@@ -159,8 +165,48 @@ impl S3Storage for Storage {
             .objects
             .binary_search_by(|object| object.name.cmp(&input.key))
             .map_err(|_| code_error!(NoSuchKey, "The specified key does not exist."))?;
-        let _obj = &self.objects[idx];
-        Err(not_supported!("GetObjectRequest").into())
+        let obj = &self.objects[idx];
+
+        let parse_range =
+            |s: &str| Range::from_header_str(s).map_err(|err| invalid_request!("Invalid header: range", err));
+        let range: Option<Range> = input.range.as_deref().map(parse_range).transpose()?;
+        let (start, end) = match range {
+            None => (0, obj.size),
+            Some(Range::Normal { first, last }) => {
+                if first as usize >= obj.size {
+                    return Err(code_error!(InvalidRange, "The requested range is not satisfiable.").into());
+                }
+                let start = first as usize;
+                let end = last.map(|last| last as usize + 1).unwrap_or(obj.size).min(obj.size);
+                if start >= end {
+                    return Err(code_error!(InvalidRange, "The requested range is not satisfiable.").into());
+                }
+                (start, end)
+            }
+            Some(Range::Suffix { last }) => {
+                let start = obj.size - (last as usize).min(obj.size);
+                (start, obj.size)
+            }
+        };
+
+        let last_modified = self.current_timestamp.format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+
+        match obj.content {
+            ObjectContent::Schema(ref content) => {
+                let stream = ByteStream::from(content.as_bytes()[start..end].to_vec());
+                let output: GetObjectOutput = GetObjectOutput {
+                    body: Some(stream),
+                    content_length: Some((end - start) as i64),
+                    last_modified: Some(last_modified),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    ..GetObjectOutput::default()
+                };
+                Ok(output)
+            }
+            ObjectContent::Data((ref _file_info, ref _state)) => {
+                return Err(not_supported!("GetObjectRequest").into());
+            }
+        }
     }
 
     async fn head_bucket(&self, input: HeadBucketRequest) -> S3StorageResult<HeadBucketOutput, HeadBucketError> {
@@ -181,7 +227,7 @@ impl S3Storage for Storage {
             .map_err(|_| code_error!(NoSuchKey, "The specified key does not exist."))?;
         let obj = &self.objects[idx];
 
-        let last_modified = self.current_timestamp.format("%a, %d %b %Y %T GMT").to_string();
+        let last_modified = self.current_timestamp.format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
         let output: HeadObjectOutput = HeadObjectOutput {
             content_length: Some(obj.size as i64),
             content_type: Some("application/octet-stream".to_owned()),
