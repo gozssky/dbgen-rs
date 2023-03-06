@@ -55,7 +55,7 @@ CREATE TABLE `test`.`t` (
   /*{{ rand.range(1610535068, 1676882755) }}*/
   `col13` bigint(20) unsigned NOT NULL DEFAULT '0'  ,
   /*{{ rand.range(1, 10000) }}*/
-  PRIMARY KEY (`f_id`)
+  PRIMARY KEY (`col1`)
 );
 ```
 2. Run dbgen
