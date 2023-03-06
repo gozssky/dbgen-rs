@@ -76,6 +76,7 @@ S3 server is running at http://127.0.0.1:9000/
 ```
 
 3. Access file using rclone
+
 List bucket
 ```
 > rclone lsd s3://
