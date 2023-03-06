@@ -1,7 +1,8 @@
 //! S3 plugin for dbgen
 
 use crate::{
-    cli::{Env, FileInfo},
+    bytes_stream::BytesStream as RawBytesStream,
+    cli::{DataFile, Env, FileInfo},
     eval::State,
 };
 
@@ -191,22 +192,37 @@ impl S3Storage for Storage {
 
         let last_modified = self.current_timestamp.format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
 
-        match obj.content {
-            ObjectContent::Schema(ref content) => {
-                let stream = ByteStream::from(content.as_bytes()[start..end].to_vec());
-                let output: GetObjectOutput = GetObjectOutput {
-                    body: Some(stream),
-                    content_length: Some((end - start) as i64),
-                    last_modified: Some(last_modified),
-                    content_type: Some("application/octet-stream".to_owned()),
-                    ..GetObjectOutput::default()
-                };
-                Ok(output)
-            }
-            ObjectContent::Data((ref _file_info, ref _state)) => {
-                return Err(not_supported!("GetObjectRequest").into());
-            }
-        }
+        let stream = match obj.content {
+            ObjectContent::Schema(ref content) => ByteStream::from(content.as_bytes()[start..end].to_vec()),
+            ObjectContent::Data((ref file_info, ref state)) => ByteStream::new(RawBytesStream::new(
+                DataFile::new(
+                    self.env.clone(),
+                    file_info.clone(),
+                    obj.name.clone(),
+                    state.clone(),
+                    start,
+                    end,
+                ),
+                4096,
+                Some(end - start),
+            )),
+        };
+
+        let content_range = if start < end {
+            Some(format!("bytes {}-{}/{}", start, end - 1, obj.size))
+        } else {
+            None
+        };
+
+        let output: GetObjectOutput = GetObjectOutput {
+            body: Some(stream),
+            content_length: Some((end - start) as i64),
+            last_modified: Some(last_modified),
+            content_range: content_range,
+            content_type: Some("application/octet-stream".to_owned()),
+            ..GetObjectOutput::default()
+        };
+        Ok(output)
     }
 
     async fn head_bucket(&self, input: HeadBucketRequest) -> S3StorageResult<HeadBucketOutput, HeadBucketError> {

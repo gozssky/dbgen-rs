@@ -42,11 +42,11 @@ impl Writer for TableWriter {
         Ok(())
     }
 
-    fn write_file_header(&mut self, _: &Schema<'_>) -> Result<(), S<Error>> {
+    fn write_file_header(&mut self, _: &Schema) -> Result<(), S<Error>> {
         Ok(())
     }
 
-    fn write_header(&mut self, _: &Schema<'_>) -> Result<(), S<Error>> {
+    fn write_header(&mut self, _: &Schema) -> Result<(), S<Error>> {
         self.write_row_separator()
     }
 
@@ -101,8 +101,8 @@ fn try_generate_rows(
         ctx = state.into_compile_context();
     }
 
-    let mut state = State::new(1, rng(), ctx);
-    let mut env = Env::new(&tables, &mut state, false, |_| Ok(TableWriter::default()))?;
+    let state = State::new(1, rng(), ctx);
+    let mut env = Env::new(tables.clone(), state, false, |_| Ok(TableWriter::default()))?;
     for _ in 0..rows {
         env.write_row()?;
     }

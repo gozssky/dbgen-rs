@@ -19,10 +19,10 @@ pub trait Format {
     fn write_value(&self, writer: &mut dyn Write, value: &Value) -> Result<(), Error>;
 
     /// Writes the content at the beginning of each file.
-    fn write_file_header(&self, writer: &mut dyn Write, schema: &Schema<'_>) -> Result<(), Error>;
+    fn write_file_header(&self, writer: &mut dyn Write, schema: &Schema) -> Result<(), Error>;
 
     /// Writes the content of an INSERT statement before all rows.
-    fn write_header(&self, writer: &mut dyn Write, schema: &Schema<'_>) -> Result<(), Error>;
+    fn write_header(&self, writer: &mut dyn Write, schema: &Schema) -> Result<(), Error>;
 
     /// Writes the column name before a value.
     fn write_value_header(&self, writer: &mut dyn Write, column: &str) -> Result<(), Error>;
@@ -66,15 +66,15 @@ impl Default for Options {
 
 /// SQL formatter.
 #[derive(Debug)]
-pub struct SqlFormat<'a>(pub &'a Options);
+pub struct SqlFormat(pub Options);
 
 /// CSV formatter.
 #[derive(Debug)]
-pub struct CsvFormat<'a>(pub &'a Options);
+pub struct CsvFormat(pub Options);
 
 /// SQL formatter using the INSERT-SET form.
 #[derive(Debug)]
-pub struct SqlInsertSetFormat<'a>(pub &'a Options);
+pub struct SqlInsertSetFormat(pub Options);
 
 /// Writes a timestamp in ISO 8601 format.
 fn write_timestamp(writer: &mut dyn Write, quote: &str, timestamp: &DateTime<ArcTz>) -> Result<(), Error> {
@@ -263,16 +263,16 @@ impl Options {
     }
 }
 
-impl Format for SqlFormat<'_> {
+impl Format for SqlFormat {
     fn write_value(&self, writer: &mut dyn Write, value: &Value) -> Result<(), Error> {
         self.0.write_sql_value(writer, value)
     }
 
-    fn write_file_header(&self, _: &mut dyn Write, _: &Schema<'_>) -> Result<(), Error> {
+    fn write_file_header(&self, _: &mut dyn Write, _: &Schema) -> Result<(), Error> {
         Ok(())
     }
 
-    fn write_header(&self, writer: &mut dyn Write, schema: &Schema<'_>) -> Result<(), Error> {
+    fn write_header(&self, writer: &mut dyn Write, schema: &Schema) -> Result<(), Error> {
         write!(writer, "INSERT INTO {} ", schema.name)?;
         if self.0.headers {
             writer.write_all(b"(")?;
@@ -304,16 +304,16 @@ impl Format for SqlFormat<'_> {
     }
 }
 
-impl Format for SqlInsertSetFormat<'_> {
+impl Format for SqlInsertSetFormat {
     fn write_value(&self, writer: &mut dyn Write, value: &Value) -> Result<(), Error> {
         self.0.write_sql_value(writer, value)
     }
 
-    fn write_file_header(&self, _: &mut dyn Write, _: &Schema<'_>) -> Result<(), Error> {
+    fn write_file_header(&self, _: &mut dyn Write, _: &Schema) -> Result<(), Error> {
         Ok(())
     }
 
-    fn write_header(&self, writer: &mut dyn Write, schema: &Schema<'_>) -> Result<(), Error> {
+    fn write_header(&self, writer: &mut dyn Write, schema: &Schema) -> Result<(), Error> {
         writeln!(writer, "INSERT INTO {} SET", schema.name)
     }
 
@@ -334,7 +334,7 @@ impl Format for SqlInsertSetFormat<'_> {
     }
 }
 
-impl CsvFormat<'_> {
+impl CsvFormat {
     fn write_bytes(&self, writer: &mut dyn Write, bytes: &ByteString) -> Result<(), Error> {
         writer.write_all(b"\"")?;
         write_with_escape(
@@ -368,7 +368,7 @@ impl CsvFormat<'_> {
     }
 }
 
-impl Format for CsvFormat<'_> {
+impl Format for CsvFormat {
     fn write_value(&self, writer: &mut dyn Write, value: &Value) -> Result<(), Error> {
         match value {
             Value::Null => writer.write_all(self.0.null_string.as_bytes()),
@@ -389,7 +389,7 @@ impl Format for CsvFormat<'_> {
         }
     }
 
-    fn write_file_header(&self, writer: &mut dyn Write, schema: &Schema<'_>) -> Result<(), Error> {
+    fn write_file_header(&self, writer: &mut dyn Write, schema: &Schema) -> Result<(), Error> {
         if !self.0.headers {
             return Ok(());
         }
@@ -402,7 +402,7 @@ impl Format for CsvFormat<'_> {
         self.write_row_separator(writer)
     }
 
-    fn write_header(&self, _: &mut dyn Write, _: &Schema<'_>) -> Result<(), Error> {
+    fn write_header(&self, _: &mut dyn Write, _: &Schema) -> Result<(), Error> {
         Ok(())
     }
 

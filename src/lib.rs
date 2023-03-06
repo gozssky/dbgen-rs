@@ -28,6 +28,7 @@ pub const FULL_VERSION: &str = concat!(
 );
 
 pub mod bytes;
+pub mod bytes_stream;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod error;

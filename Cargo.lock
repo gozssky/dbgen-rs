@@ -555,6 +555,7 @@ dependencies = [
  "dyn-clone",
  "flate2",
  "futures",
+ "futures-lite",
  "hyper",
  "memchr",
  "muldiv",
@@ -564,6 +565,7 @@ dependencies = [
  "pbr",
  "pest",
  "pest_derive",
+ "pin-project-lite",
  "rand",
  "rand_chacha",
  "rand_distr",
@@ -588,6 +590,7 @@ dependencies = [
  "tzfile",
  "vergen",
  "xz2",
+ "you-can",
  "zipf",
  "zstd",
 ]
@@ -1898,7 +1901,7 @@ dependencies = [
  "log",
  "rusoto_credential",
  "rusoto_signature",
- "rustc_version",
+ "rustc_version 0.4.0",
  "serde",
  "serde_json",
  "tokio",
@@ -1956,7 +1959,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rusoto_credential",
- "rustc_version",
+ "rustc_version 0.4.0",
  "serde",
  "sha2 0.9.9",
  "tokio",
@@ -1970,11 +1973,20 @@ checksum = "7ef03e0a2b150c7a90d01faf6254c9c48a41e95fb2a8c2ac1c6f0d2b9aefc342"
 
 [[package]]
 name = "rustc_version"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "138e3e0acb6c9fb258b19b67cb8abd63c00679d2851805ea151465464fe9030a"
+dependencies = [
+ "semver 0.9.0",
+]
+
+[[package]]
+name = "rustc_version"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa0f585226d2e68097d4f95d113b15b83a82e819ab25717ec0590d9584ef366"
 dependencies = [
- "semver",
+ "semver 1.0.16",
 ]
 
 [[package]]
@@ -2101,9 +2113,24 @@ dependencies = [
 
 [[package]]
 name = "semver"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7eb9ef2c18661902cc47e535f9bc51b78acd254da71d375c2f6720d9a40403"
+dependencies = [
+ "semver-parser",
+]
+
+[[package]]
+name = "semver"
 version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58bc9567378fc7690d6b2addae4e60ac2eeea07becb2c64b9f218b53865cba2a"
+
+[[package]]
+name = "semver-parser"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
@@ -2865,6 +2892,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
 dependencies = [
  "lzma-sys",
+]
+
+[[package]]
+name = "you-can"
+version = "0.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba6a85078bdc61e033b9b2c8f74890f7ba0b995547fd3644b70b686072672175"
+dependencies = [
+ "you-can-build-macros",
+]
+
+[[package]]
+name = "you-can-build-macros"
+version = "0.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a2ad209862b430f3d1411729775f7fcdaf3cdf2727963efda91a03f9e1bdf82"
+dependencies = [
+ "quote",
+ "rustc_version 0.2.3",
+ "syn",
 ]
 
 [[package]]

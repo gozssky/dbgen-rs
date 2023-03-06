@@ -124,17 +124,17 @@ pub struct Table {
 }
 
 /// The schema information extracted from the compiled table.
-#[derive(Debug, Copy, Clone)]
-pub struct Schema<'a> {
+#[derive(Debug, Clone)]
+pub struct Schema {
     /// Table name (qualified or unqualified).
-    pub name: &'a str,
+    pub name: String,
     /// Content of table schema.
-    pub content: &'a str,
+    pub content: String,
     /// The ranges in `content` which column names appear.
-    column_name_ranges: &'a [Range<usize>],
+    column_name_ranges: Vec<Range<usize>>,
 }
 
-impl<'a> Schema<'a> {
+impl Schema {
     /// Returns an iterator of column names associated with the table.
     pub fn column_names(&self) -> impl Iterator<Item = &str> + '_ {
         self.column_name_ranges.iter().map(move |r| &self.content[r.clone()])
@@ -143,11 +143,11 @@ impl<'a> Schema<'a> {
 
 impl Table {
     /// Gets the schema associated with the table.
-    pub fn schema(&self, qualified: bool) -> Schema<'_> {
+    pub fn schema(&self, qualified: bool) -> Schema {
         Schema {
-            name: self.name.table_name(qualified),
-            content: &self.content,
-            column_name_ranges: &self.column_name_ranges,
+            name: self.name.table_name(qualified).to_owned(),
+            content: self.content.to_owned(),
+            column_name_ranges: self.column_name_ranges.clone(),
         }
     }
 }

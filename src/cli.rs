@@ -17,6 +17,7 @@ use chrono::{NaiveDateTime, ParseResult, Utc};
 use data_encoding::{DecodeError, DecodeKind, HEXLOWER_PERMISSIVE};
 use dyn_clone::DynClone;
 use flate2::write::GzEncoder;
+use futures_lite::io::AsyncRead;
 use muldiv::MulDiv;
 use pbr::{MultiBar, Units};
 use rand::{
@@ -39,9 +40,11 @@ use std::{
     io::{self, sink, stdin, BufWriter, Read, Write},
     mem,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     thread::{sleep, spawn},
     time::Duration,
 };
@@ -250,7 +253,7 @@ pub struct Args {
     pub initialize: Vec<String>,
 
     /// Serve generated data over S3.
-    #[structopt(long, conflicts_with("compression"))]
+    #[structopt(long, conflicts_with_all(&["compression", "size"]))]
     #[serde(skip_serializing_if = "is_false")]
     pub s3: bool,
 
@@ -835,11 +838,11 @@ impl FormatName {
     }
 
     /// Creates a formatter writer given the name.
-    fn create(self, options: &Options) -> Box<dyn Format + '_> {
+    fn create(self, options: &Options) -> Box<dyn Format + Send> {
         match self {
-            Self::Sql => Box::new(SqlFormat(options)),
-            Self::Csv => Box::new(CsvFormat(options)),
-            Self::SqlInsertSet => Box::new(SqlInsertSetFormat(options)),
+            Self::Sql => Box::new(SqlFormat(options.clone())),
+            Self::Csv => Box::new(CsvFormat(options.clone())),
+            Self::SqlInsertSet => Box::new(SqlInsertSetFormat(options.clone())),
         }
     }
 
@@ -903,7 +906,7 @@ impl CompressionName {
     }
 
     /// Wraps a writer with a compression layer on top.
-    fn wrap<'a, W: Write + 'a>(self, inner: W, level: u8) -> Box<dyn Write + 'a> {
+    fn wrap<'a, W: Write + Send + 'a>(self, inner: W, level: u8) -> Box<dyn Write + Send + 'a> {
         match self {
             Self::Gzip => Box::new(GzEncoder::new(inner, flate2::Compression::new(level.into()))),
             Self::Xz => Box::new(XzEncoder::new(inner, level.into())),
@@ -961,9 +964,11 @@ impl ComponentName {
 }
 
 /// A [`Writer`] which counts how many bytes are written.
-struct FormatWriter<'a> {
+struct FormatWriter {
     /// The target writer.
-    writer: BufWriter<Box<dyn Write>>,
+    writer: Box<dyn Write + Send>,
+    /// The memory writer used when generating s3 files.
+    mem_writer: Option<MemWriter>,
     /// Total number of bytes currently written into `writer`.
     written_size: u64,
     /// Total number of bytes written which is not yet committed into
@@ -976,26 +981,19 @@ struct FormatWriter<'a> {
     /// The file size limit and the associated lexicographical counter for when
     /// size-splitting is needed.
     target_size_and_counter: Option<(u64, LexCtr)>,
-    /// The output file format.
-    format: &'a dyn Format,
 }
 
-impl<'a> FormatWriter<'a> {
+impl FormatWriter {
     /// Creates a new [`WriteWrapper`].
-    fn new(
-        path_prefix: PathBuf,
-        path_extension: &'static str,
-        target_size: Option<u64>,
-        format: &'a dyn Format,
-    ) -> Self {
+    fn new(path_prefix: PathBuf, path_extension: &'static str, target_size: Option<u64>) -> Self {
         Self {
-            writer: BufWriter::with_capacity(0, Box::new(sink())),
+            writer: Box::new(BufWriter::with_capacity(0, Box::new(sink()))),
+            mem_writer: None,
             written_size: 0,
             uncommitted_size: 0,
             path_prefix,
             path_extension,
             target_size_and_counter: target_size.map(|s| (s, LexCtr::default())),
-            format,
         }
     }
 
@@ -1032,9 +1030,14 @@ impl<'a> FormatWriter<'a> {
     }
 }
 
-impl Write for FormatWriter<'_> {
+impl Write for FormatWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let bytes_written = self.writer.write(buf)?;
+        let bytes_written = if let Some(mem_writer) = &mut self.mem_writer {
+            mem_writer.write(buf);
+            buf.len()
+        } else {
+            self.writer.write(buf)?
+        };
         self.written_size += bytes_written as u64;
         self.uncommitted_size += bytes_written as u64;
         Ok(bytes_written)
@@ -1044,41 +1047,39 @@ impl Write for FormatWriter<'_> {
     }
 }
 
-impl Writer for FormatWriter<'_> {
-    fn write_value(&mut self, value: &Value) -> Result<(), S<Error>> {
-        self.format
+impl Writer for FormatWriter {
+    fn write_value(&mut self, format: &dyn Format, value: &Value) -> Result<(), S<Error>> {
+        format
             .write_value(self, value)
             .with_path_fn("write value", || self.path())
     }
-    fn write_file_header(&mut self, schema: &Schema<'_>) -> Result<(), S<Error>> {
-        self.format
+    fn write_file_header(&mut self, format: &dyn Format, schema: &Schema) -> Result<(), S<Error>> {
+        format
             .write_file_header(self, schema)
             .with_path_fn("write file header", || self.path())
     }
-    fn write_header(&mut self, schema: &Schema<'_>) -> Result<(), S<Error>> {
-        self.format
+    fn write_header(&mut self, format: &dyn Format, schema: &Schema) -> Result<(), S<Error>> {
+        format
             .write_header(self, schema)
             .with_path_fn("write header", || self.path())
     }
-    fn write_value_header(&mut self, column: &str) -> Result<(), S<Error>> {
-        self.format
+    fn write_value_header(&mut self, format: &dyn Format, column: &str) -> Result<(), S<Error>> {
+        format
             .write_value_header(self, column)
             .with_path_fn("write value header", || self.path())
     }
-    fn write_value_separator(&mut self) -> Result<(), S<Error>> {
-        self.format
+    fn write_value_separator(&mut self, format: &dyn Format) -> Result<(), S<Error>> {
+        format
             .write_value_separator(self)
             .with_path_fn("write value separator", || self.path())
     }
-    fn write_row_separator(&mut self) -> Result<(), S<Error>> {
-        self.format
+    fn write_row_separator(&mut self, format: &dyn Format) -> Result<(), S<Error>> {
+        format
             .write_row_separator(self)
             .with_path_fn("write row separator", || self.path())
     }
-    fn write_trailer(&mut self) -> Result<(), S<Error>> {
-        self.format
-            .write_trailer(self)
-            .with_path_fn("write trailer", || self.path())
+    fn write_trailer(&mut self, format: &dyn Format) -> Result<(), S<Error>> {
+        format.write_trailer(self).with_path_fn("write trailer", || self.path())
     }
 }
 
@@ -1183,7 +1184,7 @@ impl Env {
         objects
     }
 
-    fn open_data_file(&self, path: PathBuf) -> Result<Box<dyn Write>, S<Error>> {
+    fn open_data_file(&self, path: PathBuf) -> Result<Box<dyn Write + Send>, S<Error>> {
         Ok(if !ComponentName::Data.is_in(self.components_mask) {
             Box::new(sink())
         } else if let Some((compression, level)) = self.compression {
@@ -1205,15 +1206,16 @@ impl Env {
         let mut objects = Vec::new();
         let content = ObjectContent::Data((info.clone(), state.clone()));
 
-        let mut fwe = writer::Env::new(&self.tables, state, self.qualified, |table| {
+        let mut fwe = writer::Env::new(self.tables.clone(), state.clone(), self.qualified, |table| {
             let path = self
                 .out_dir
                 .as_ref()
                 .unwrap_or(&PathBuf::new())
                 .join([table.name.unique_name(), &path_suffix].concat());
-            let mut w = FormatWriter::new(path, self.format.extension(), self.file_size, &*format);
+            let mut w = FormatWriter::new(path, self.format.extension(), self.file_size);
+            w.write_file_header(&*format, &table.schema(self.qualified))?;
             if self.out_dir.is_some() {
-                w.writer = BufWriter::new(self.open_data_file(w.path())?);
+                w.writer = Box::new(BufWriter::new(self.open_data_file(w.path())?));
             };
             Ok(w)
         })?;
@@ -1225,9 +1227,9 @@ impl Env {
                 self.rows_count
             };
             for _ in 0..rows_count {
-                fwe.write_row()?;
+                fwe.write_row(&*format)?;
             }
-            fwe.write_trailer()?;
+            fwe.write_trailer(&*format)?;
 
             let mut total_uncommitted_size = 0;
             for (table, w) in fwe.tables() {
@@ -1241,8 +1243,8 @@ impl Env {
 
                     let new_path = w.path();
                     w.writer.flush().with_path("flush old file for rotation", &new_path)?;
-                    w.writer = BufWriter::new(self.open_data_file(new_path)?);
-                    w.write_file_header(&table.schema(self.qualified))?;
+                    w.writer = Box::new(BufWriter::new(self.open_data_file(new_path)?));
+                    w.write_file_header(&*format, &table.schema(self.qualified))?;
                 }
             }
             WRITTEN_SIZE.fetch_add(total_uncommitted_size, Ordering::Relaxed);
@@ -1260,6 +1262,136 @@ impl Env {
         }
 
         Ok(objects)
+    }
+}
+
+/// A data file reader.
+pub struct DataFile {
+    env: Env,
+    info: FileInfo,
+    path: String,
+    start: usize,
+    end: usize,
+    fwe: writer::Env<FormatWriter>,
+    wrote_header: bool,
+    inserts_count: u32,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    read_pos: usize,
+}
+
+impl DataFile {
+    /// Creates a new DataFile.
+    pub fn new(env: Env, info: FileInfo, path: String, state: State, start: usize, end: usize) -> Self {
+        let path_suffix = format!(".{0:01$}", info.file_index, env.file_num_digits);
+
+        let fwe = writer::Env::new(env.tables.clone(), state, env.qualified, |table| {
+            let path = env
+                .out_dir
+                .as_ref()
+                .unwrap_or(&PathBuf::new())
+                .join([table.name.unique_name(), &path_suffix].concat());
+            let w = FormatWriter::new(path, env.format.extension(), env.file_size);
+            Ok(w)
+        })
+        .unwrap();
+        Self {
+            env,
+            info,
+            path,
+            start,
+            end,
+            fwe,
+            wrote_header: false,
+            inserts_count: 0,
+            buf: Vec::with_capacity(4096),
+            buf_pos: 0,
+            read_pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for DataFile {
+    fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        if self.read_pos >= self.end {
+            return Poll::Ready(Ok(0));
+        }
+        if self.buf_pos >= self.buf.len() {
+            let path = self.path.clone();
+            self.buf_pos = 0;
+            let format = self.env.format.create(&self.env.format_options);
+            let schema = self.env.tables[0].schema(self.env.qualified);
+
+            while self.inserts_count < self.info.inserts_count {
+                self.buf.truncate(0);
+                let mem_writer = MemWriter {
+                    buf: mem::take(&mut self.buf),
+                };
+                let wrote_header = self.wrote_header;
+                let (_, w) = self
+                    .fwe
+                    .tables()
+                    .find(|(_, w)| w.path().to_string_lossy().to_string() == path)
+                    .unwrap();
+                w.mem_writer = Some(mem_writer);
+                if !wrote_header {
+                    w.write_file_header(&*format, &schema).unwrap();
+                    self.wrote_header = true;
+                }
+
+                let cur = self.inserts_count;
+                let rows_count = if cur == self.info.inserts_count - 1 {
+                    self.info.last_insert_rows_count
+                } else {
+                    self.env.rows_count
+                };
+                for _ in 0..rows_count {
+                    self.fwe.write_row(&*format).unwrap();
+                }
+                self.fwe.write_trailer(&*format).unwrap();
+                self.inserts_count += 1;
+
+                let (_, w) = self
+                    .fwe
+                    .tables()
+                    .find(|(_, w)| w.path().to_string_lossy().to_string() == path)
+                    .unwrap();
+                let mem_writer = w.mem_writer.take().unwrap();
+                self.buf = mem_writer.buf;
+
+                if self.read_pos + self.buf.len() <= self.start {
+                    self.read_pos += self.buf.len();
+                    continue;
+                }
+
+                if self.read_pos < self.start {
+                    self.buf_pos = self.start - self.read_pos;
+                    self.read_pos = self.start;
+                }
+                break;
+            }
+
+            if self.read_pos + self.buf.len() - self.buf_pos > self.end {
+                let l = self.buf_pos + self.end - self.read_pos;
+                self.buf.truncate(l);
+            }
+        }
+
+        let n = (self.buf.len() - self.buf_pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        self.read_pos += n;
+        return Poll::Ready(Ok(n));
+    }
+}
+
+struct MemWriter {
+    buf: Vec<u8>,
+}
+
+impl MemWriter {
+    fn write(&mut self, buf: &[u8]) {
+        self.buf.extend_from_slice(buf);
     }
 }
 
