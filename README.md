@@ -22,3 +22,5 @@ expressions.
     * [`dbdbgen` reference](Dbdbgen.md)
 
 * [WASM playground](https://kennytm.github.io/dbgen/)
+
+* Serve generated data over S3
